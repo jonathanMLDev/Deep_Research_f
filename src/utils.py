@@ -1,5 +1,3 @@
-
-
 """Research Utilities and Tools.
 
 This module provides search and content processing utilities for the research agent,
@@ -16,14 +14,20 @@ from langchain_core.tools import tool, InjectedToolArg
 from tavily import TavilyClient
 
 from deep_research.state_research import Summary
-from deep_research.prompts import summarize_webpage_prompt, report_generation_with_draft_insight_prompt
+from deep_research.prompts import (
+    summarize_webpage_prompt,
+    report_generation_with_draft_insight_prompt,
+)
 from deep_research.usage_tracker import get_tracker
+from deep_research.run_logger import get_logger
 
 # ===== UTILITY FUNCTIONS =====
+
 
 def get_today_str() -> str:
     """Get current date in a human-readable format."""
     return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
+
 
 def get_current_dir() -> Path:
     """Get the current directory of the module.
@@ -38,6 +42,7 @@ def get_current_dir() -> Path:
     except NameError:  # __file__ is not defined
         return Path.cwd()
 
+
 # ===== CONFIGURATION =====
 summarization_model = get_light_model()
 writer_model = get_model(max_tokens=32000)  # Reduced from 32000 to 8000 for efficiency
@@ -45,6 +50,7 @@ tavily_client = TavilyClient()
 MAX_CONTEXT_LENGTH = 250000
 
 # ===== SEARCH FUNCTIONS =====
+
 
 def tavily_search_multiple(
     search_queries: List[str],
@@ -67,18 +73,39 @@ def tavily_search_multiple(
     # Execute searches sequentially. Note: yon can use AsyncTavilyClient to parallelize this step.
     tracker = get_tracker()
     search_docs = []
+    logger = get_logger()
+
     for query in search_queries:
         result = tavily_client.search(
             query,
             max_results=max_results,
             include_raw_content=include_raw_content,
-            topic=topic
+            topic=topic,
         )
         search_docs.append(result)
         # Track Tavily API call
         tracker.track_tavily_call()
 
+        try:
+            results_list = result.get("results", []) or []
+            results_count = len(results_list)
+            urls = [item.get("url") for item in results_list if item.get("url")]
+            logger.log_step(
+                "tavily.search",
+                "Tavily search completed",
+                extra={
+                    "query": query,
+                    "results": results_count,
+                    "urls": urls,
+                    "topic": topic,
+                },
+            )
+        except Exception:
+            # Logging must not break search flow
+            pass
+
     return search_docs
+
 
 def summarize_webpage_content(webpage_content: str) -> str:
     """Summarize webpage content using the configured summarization model.
@@ -94,16 +121,23 @@ def summarize_webpage_content(webpage_content: str) -> str:
         structured_model = summarization_model.with_structured_output(Summary)
 
         # Generate summary
-        response = structured_model.invoke([
-            HumanMessage(content=summarize_webpage_prompt.format(
-                webpage_content=webpage_content,
-                date=get_today_str()
-            ))
-        ])
+        response = structured_model.invoke(
+            [
+                HumanMessage(
+                    content=summarize_webpage_prompt.format(
+                        webpage_content=webpage_content, date=get_today_str()
+                    )
+                )
+            ]
+        )
 
-        # Track token usage
         tracker = get_tracker()
-        tracker.track_openai_response(response)
+        token_usage = tracker.track_openai_response(
+            response,
+            model_name="summarization_model",
+            step_name="utils.summarize_webpage_content",
+            metadata={"content_length": len(webpage_content)},
+        )
         summary = response
 
         # Format summary with clear structure
@@ -112,11 +146,28 @@ def summarize_webpage_content(webpage_content: str) -> str:
             f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
         )
 
+        try:
+            logger = get_logger()
+            logger.log_step(
+                "utils.summarize_webpage_content",
+                "Webpage content summarized",
+                tokens=token_usage,
+                extra={"content_length": len(webpage_content)},
+                model_label="summarization_model",
+            )
+        except Exception:
+            pass
+
         return formatted_summary
 
     except Exception as e:
         print(f"Failed to summarize webpage: {str(e)}")
-        return webpage_content[:1000] + "..." if len(webpage_content) > 1000 else webpage_content
+        return (
+            webpage_content[:1000] + "..."
+            if len(webpage_content) > 1000
+            else webpage_content
+        )
+
 
 def deduplicate_search_results(search_results: List[dict]) -> dict:
     """Deduplicate search results by URL to avoid processing duplicate content.
@@ -130,12 +181,13 @@ def deduplicate_search_results(search_results: List[dict]) -> dict:
     unique_results = {}
 
     for response in search_results:
-        for result in response['results']:
-            url = result['url']
+        for result in response["results"]:
+            url = result["url"]
             if url not in unique_results:
                 unique_results[url] = result
 
     return unique_results
+
 
 def process_search_results(unique_results: dict) -> dict:
     """Process search results by summarizing content where available.
@@ -151,17 +203,17 @@ def process_search_results(unique_results: dict) -> dict:
     for url, result in unique_results.items():
         # Use existing content if no raw content for summarization
         if not result.get("raw_content"):
-            content = result['content']
+            content = result["content"]
         else:
             # Summarize raw content for better processing
-            content = summarize_webpage_content(result['raw_content'][:MAX_CONTEXT_LENGTH])
+            content = summarize_webpage_content(
+                result["raw_content"][:MAX_CONTEXT_LENGTH]
+            )
 
-        summarized_results[url] = {
-            'title': result['title'],
-            'content': content
-        }
+        summarized_results[url] = {"title": result["title"], "content": content}
 
     return summarized_results
+
 
 def format_search_output(summarized_results: dict) -> str:
     """Format search results into a well-structured string output.
@@ -185,13 +237,19 @@ def format_search_output(summarized_results: dict) -> str:
 
     return formatted_output
 
+
 # ===== RESEARCH TOOLS =====
+
 
 @tool(parse_docstring=True)
 def tavily_search(
     query: str,
-    max_results: Annotated[int, InjectedToolArg] = 3,  # Reduced from 3 to 2 for efficiency
-    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+    max_results: Annotated[
+        int, InjectedToolArg
+    ] = 3,  # Reduced from 3 to 2 for efficiency
+    topic: Annotated[
+        Literal["general", "news", "finance"], InjectedToolArg
+    ] = "general",
 ) -> str:
     """Fetch results from Tavily search API with content summarization.
 
@@ -220,6 +278,7 @@ def tavily_search(
     # Format output for consumption
     return format_search_output(summarized_results)
 
+
 @tool(parse_docstring=True)
 def think_tool(reflection: str) -> str:
     """Tool for strategic reflection on research progress and decision-making.
@@ -247,10 +306,13 @@ def think_tool(reflection: str) -> str:
     """
     return f"Reflection recorded: {reflection}"
 
+
 @tool(parse_docstring=True)
-def refine_draft_report(research_brief: Annotated[str, InjectedToolArg],
-                        findings: Annotated[str, InjectedToolArg],
-                        draft_report: Annotated[str, InjectedToolArg]):
+def refine_draft_report(
+    research_brief: Annotated[str, InjectedToolArg],
+    findings: Annotated[str, InjectedToolArg],
+    draft_report: Annotated[str, InjectedToolArg],
+):
     """Refine draft report
 
     Synthesizes all research findings into a comprehensive draft report
@@ -268,13 +330,37 @@ def refine_draft_report(research_brief: Annotated[str, InjectedToolArg],
         research_brief=research_brief,
         findings=findings,
         draft_report=draft_report,
-        date=get_today_str()
+        date=get_today_str(),
     )
 
     draft_report = writer_model.invoke([HumanMessage(content=draft_report_prompt)])
 
-    # Track token usage
     tracker = get_tracker()
-    tracker.track_openai_response(draft_report)
+    token_usage = tracker.track_openai_response(
+        draft_report,
+        model_name="writer_model",
+        step_name="utils.refine_draft_report",
+        metadata={
+            "research_brief_length": len(research_brief),
+            "findings_length": len(findings),
+            "draft_report_length": len(draft_report_prompt),
+        },
+    )
+
+    try:
+        logger = get_logger()
+        logger.log_step(
+            "utils.refine_draft_report",
+            "Draft report refined",
+            tokens=token_usage,
+            extra={
+                "research_brief_length": len(research_brief),
+                "findings_length": len(findings),
+                "draft_report_length": len(draft_report_prompt),
+            },
+            model_label="writer_model",
+        )
+    except Exception:
+        pass
 
     return draft_report.content

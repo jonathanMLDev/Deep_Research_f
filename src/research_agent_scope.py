@@ -1,4 +1,3 @@
-
 """User Clarification and Research Brief Generation.
 
 This module implements the scoping phase of the research workflow, where we:
@@ -9,6 +8,7 @@ The workflow uses structured output to make deterministic decisions about
 whether sufficient context exists to proceed with research.
 """
 
+import os
 from datetime import datetime
 from typing_extensions import Literal
 
@@ -17,15 +17,52 @@ from langchain_core.messages import HumanMessage, get_buffer_string
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 
-from deep_research.prompts import transform_messages_into_research_topic_human_msg_prompt, draft_report_generation_prompt, clarify_with_user_instructions
-from deep_research.state_scope import AgentState, ResearchQuestion, AgentInputState, DraftReport
+from deep_research.prompts import (
+    transform_messages_into_research_topic_human_msg_prompt,
+    draft_report_generation_prompt,
+)
+from deep_research.state_scope import (
+    AgentState,
+    ResearchQuestion,
+    AgentInputState,
+    DraftReport,
+)
 from deep_research.usage_tracker import get_tracker
+from deep_research.run_logger import get_logger
 
 # ===== UTILITY FUNCTIONS =====
+
 
 def get_today_str() -> str:
     """Get current date in a human-readable format."""
     return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
+
+
+def _handle_api_error(error: Exception) -> RuntimeError:
+    """Handle API errors and raise appropriate RuntimeError."""
+    error_msg = str(error)
+    if (
+        "429" in error_msg
+        or "quota" in error_msg.lower()
+        or "insufficient_quota" in error_msg.lower()
+    ):
+        return RuntimeError(
+            "OpenAI API Quota Exceeded: Your OpenAI API key has exceeded its quota or billing limit. "
+            "Please check your OpenAI account billing and usage at https://platform.openai.com/usage. "
+            "You may need to add payment information or upgrade your plan."
+        )
+    elif "401" in error_msg or (
+        "invalid" in error_msg.lower() and "api key" in error_msg.lower()
+    ):
+        return RuntimeError(
+            "OpenAI API Key Error: Your API key is invalid or expired. "
+            "Please check your OPENAI_API_KEY in your .env file or environment variables."
+        )
+    else:
+        return RuntimeError(
+            f"Error: {error_msg}. Please check your API configuration and try again."
+        )
+
 
 # ===== CONFIGURATION =====
 
@@ -35,132 +72,125 @@ creative_model = get_model()
 
 # ===== WORKFLOW NODES =====
 
-def clarify_with_user(state: AgentState) -> Command[Literal["write_research_brief"]]:
-    #uncomment if you want to enable this module
+
+def clarify_with_user(
+    state: AgentState,
+) -> Command[Literal["write_research_brief"]]:
     """
     Determine if the user's request contains sufficient information to proceed with research.
 
-    Uses structured output to make deterministic decisions and avoid hallucination.
-    Routes to either research brief generation or ends with a clarification question.
+    Note: Initial report handling is done in the full graph (research_agent_full.py),
+    not in the scope graph. This function only handles the normal research workflow.
     """
+    # Normal flow: proceed to research brief generation
+    # Initial report routing to red_team_evaluation is handled in research_agent_full.py
+    return Command(goto="write_research_brief")
 
-    """
-    # Set up structured output model
-    structured_output_model = model.with_structured_output(ClarifyWithUser)
-
-    # Invoke the model with clarification instructions
-    response = structured_output_model.invoke([
-        HumanMessage(content=clarify_with_user_instructions.format(
-            messages=get_buffer_string(messages=state["messages"]),
-            date=get_today_str()
-        ))
-    ])
-
-    # Route based on clarification need
-    if response.need_clarification:
-        return Command(
-            goto=END,
-            update={"messages": [AIMessage(content=response.question)]}
-        )
-    else:
-    """
-    return Command(
-        goto="write_research_brief"
-    )
 
 def write_research_brief(state: AgentState) -> Command[Literal["write_draft_report"]]:
-    """
-    Transform the conversation history into a comprehensive research brief.
-
-    Uses structured output to ensure the brief follows the required format
-    and contains all necessary details for effective research.
-    """
-    # Set up structured output model
+    """Transform the conversation history into a comprehensive research brief."""
     structured_output_model = model.with_structured_output(ResearchQuestion)
+    user_request = state.get("messages", [])[-1]
 
     try:
-        # Generate research brief from conversation history
-        response = structured_output_model.invoke([
-            HumanMessage(content=transform_messages_into_research_topic_human_msg_prompt.format(
-                messages=get_buffer_string(state.get("messages", [])),
-                date=get_today_str()
-            ))
-        ])
+        response = structured_output_model.invoke(
+            [
+                HumanMessage(
+                    content=transform_messages_into_research_topic_human_msg_prompt.format(
+                        messages=get_buffer_string(messages=[user_request]),
+                        date=get_today_str(),
+                    )
+                )
+            ]
+        )
 
-        # Track token usage
         tracker = get_tracker()
-        tracker.track_openai_response(response)
+        tracker.track_openai_response(
+            response,
+            model_name="writer_model",
+            step_name="scope.write_research_brief",
+            metadata={
+                "brief_length": (
+                    len(response.research_brief)
+                    if hasattr(response, "research_brief")
+                    else 0
+                )
+            },
+        )
 
-        # Update state with generated research brief and pass it to the supervisor
+        original_user_request = state.get("original_user_request") or user_request
+
         return Command(
-                goto="write_draft_report",
-                update={"research_brief": response.research_brief}
-            )
+            goto="write_draft_report",
+            update={
+                "research_brief": response.research_brief,
+                "user_request": user_request,
+                "original_user_request": original_user_request,
+            },
+        )
     except Exception as e:
-        error_msg = str(e)
-        # Check for common API errors
-        if "429" in error_msg or "quota" in error_msg.lower() or "insufficient_quota" in error_msg.lower():
-            raise RuntimeError(
-                "OpenAI API Quota Exceeded: Your OpenAI API key has exceeded its quota or billing limit. "
-                "Please check your OpenAI account billing and usage at https://platform.openai.com/usage. "
-                "You may need to add payment information or upgrade your plan."
-            ) from e
-        elif "401" in error_msg or "invalid" in error_msg.lower() and "api key" in error_msg.lower():
-            raise RuntimeError(
-                "OpenAI API Key Error: Your API key is invalid or expired. "
-                "Please check your OPENAI_API_KEY in your .env file or environment variables."
-            ) from e
-        else:
-            raise RuntimeError(
-                f"Error generating research brief: {error_msg}. "
-                "Please check your API configuration and try again."
-            ) from e
+        raise _handle_api_error(e) from e
+
 
 def write_draft_report(state: AgentState) -> Command[Literal["__end__"]]:
-    """
-    Final report generation node.
-
-    Synthesizes all research findings into a comprehensive final report
-    """
-    # Set up structured output model
+    """Synthesize all research findings into a comprehensive final report."""
     structured_output_model = creative_model.with_structured_output(DraftReport)
     research_brief = state.get("research_brief", "")
     draft_report_prompt = draft_report_generation_prompt.format(
-        research_brief=research_brief,
-        date=get_today_str()
+        research_brief=research_brief, date=get_today_str()
     )
 
     try:
-        response = structured_output_model.invoke([HumanMessage(content=draft_report_prompt)])
+        response = structured_output_model.invoke(
+            [HumanMessage(content=draft_report_prompt)]
+        )
 
-        # Track token usage
         tracker = get_tracker()
-        tracker.track_openai_response(response)
+        tracker.track_openai_response(
+            response,
+            model_name="writer_model",
+            step_name="scope.write_draft_report",
+            metadata={"research_brief_length": len(research_brief)},
+        )
 
         return {
             "research_brief": research_brief,
             "draft_report": response.draft_report,
-            "supervisor_messages": ["Here is the draft report: " + response.draft_report, research_brief]
+            "supervisor_messages": [
+                "Here is the draft report: " + response.draft_report,
+                research_brief,
+            ],
         }
     except Exception as e:
-        error_msg = str(e)
-        # Check for common API errors
-        if "429" in error_msg or "quota" in error_msg.lower() or "insufficient_quota" in error_msg.lower():
-            raise RuntimeError(
-                "OpenAI API Quota Exceeded: Your OpenAI API key has exceeded its quota or billing limit. "
-                "Please check your OpenAI account billing and usage at https://platform.openai.com/usage. "
-                "You may need to add payment information or upgrade your plan."
-            ) from e
-        elif "401" in error_msg or "invalid" in error_msg.lower() and "api key" in error_msg.lower():
-            raise RuntimeError(
-                "OpenAI API Key Error: Your API key is invalid or expired. "
-                "Please check your OPENAI_API_KEY in your .env file or environment variables."
-            ) from e
+        raise _handle_api_error(e) from e
+
+
+# ===== INITIAL REPORT ENRICHMENT NODE (used in full graph) =====
+
+
+def _extract_gaps_from_feedback(red_team_feedback: dict) -> str:
+    """Extract and format gaps from red team feedback."""
+    gaps = []
+    gaps.extend(red_team_feedback.get("priority_issues", []))
+    gaps.extend(red_team_feedback.get("specific_suggestions", []))
+
+    gap_lines = []
+    for idx, item in enumerate(gaps[:10], 1):
+        if isinstance(item, dict):
+            issue = item.get("issue") or item.get("suggestion") or str(item)
+            severity = item.get("severity", "")
+            gap_lines.append(
+                f"{idx}. [{severity.upper()}] {issue}"
+                if severity
+                else f"{idx}. {issue}"
+            )
         else:
-            raise RuntimeError(
-                f"Error generating draft report: {error_msg}. "
-                "Please check your API configuration and try again."
-            ) from e
+            gap_lines.append(f"{idx}. {item}")
+    return "\n".join(gap_lines) if gap_lines else "No explicit gaps listed."
+
+
+# ===== EVIDENCE REFRESH NODE (used in full graph) =====
+
 
 # ===== GRAPH CONSTRUCTION =====
 

@@ -1,8 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "thinkdepthai_deep_research"
+name = "deep-research"
 version = "0.1.0"
-description = "ThinkDepth.ai Deep Research"
+description = "Multi-agent research system using Self-Balancing Agentic AI"
 requires-python = ">=3.11"
+readme = "README.md"
+license = {file = "LICENSE"}
+
 dependencies = [
 "langgraph>=0.5.4",
 "langchain>=0.3.0",
@@ -16,45 +23,12 @@ dependencies = [
 "jupyter>=1.0.0",
 "ipykernel>=6.20.0",
 "tavily-python>=0.5.0",
-"python-dotenv>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "aiohttp>=3.9.0",
 ]
-
-[project.optional-dependencies]
-dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
-
-[build-system]
-requires = ["setuptools>=73.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["deep_research"]
 
 [tool.setuptools.package-dir]
-"deep_research" = "src"
-
-[tool.setuptools.package-data]
-"*" = ["py.typed"]
-
-[tool.ruff]
-lint.select = [
-    "E",    # pycodestyle
-    "F",    # pyflakes
-    "I",    # isort
-    "D",    # pydocstyle
-    "D401", # First line should be in imperative mood
-    "T201",
-    "UP",
-]
-lint.ignore = [
-    "UP006",
-    "UP007",
-    "UP035",
-    "D417",
-    "E501",
-]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D", "UP"]
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"
+deep_research = "src"
