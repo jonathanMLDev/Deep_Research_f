@@ -1,1 +1,1 @@
-"""Deep Research From Scratch - Tutorial implementation."""
+"""Deep Research - Multi-agent research system."""
