@@ -30,7 +30,7 @@ from deep_research.run_logger import get_logger
 
 # Maximum number of Tavily searches per researcher agent
 # Can be overridden via MAX_TAVILY_SEARCHES environment variable
-MAX_TAVILY_SEARCHES = int(os.getenv("MAX_TAVILY_SEARCHES", "5"))
+MAX_TAVILY_SEARCHES = int(os.getenv("MAX_TAVILY_SEARCHES", "20"))
 
 # Set up tools and model binding
 tools = [tavily_search, think_tool]
@@ -58,9 +58,25 @@ def llm_call(state: ResearcherState):
     formatted_prompt = research_agent_prompt.format(
         date=get_today_str(), max_searches=MAX_TAVILY_SEARCHES
     )
-    response = model_with_tools.invoke(
-        [SystemMessage(content=formatted_prompt)] + state["researcher_messages"]
-    )
+    
+    # ENFORCEMENT: If no Tavily searches have been performed, add a mandatory reminder
+    tavily_search_count = state.get("tavily_search_count", 0)
+    messages = [SystemMessage(content=formatted_prompt)] + state["researcher_messages"]
+    
+    if tavily_search_count == 0 and len(state["researcher_messages"]) > 0:
+        # Add a reminder that searching is mandatory
+        reminder = HumanMessage(
+            content="⚠️ MANDATORY: You have not performed any Tavily searches yet. "
+                   "You MUST call tavily_search at least once before you can provide an answer. "
+                   "Please perform a Tavily search now related to the research topic."
+        )
+        messages.append(reminder)
+        # Force the model to call tavily_search so at least one search is conducted
+        # (some models return text only and skip tools without this)
+        tool_choice = {"type": "function", "function": {"name": "tavily_search"}}
+        response = model_with_tools.invoke(messages, tool_choice=tool_choice)
+    else:
+        response = model_with_tools.invoke(messages)
 
     tracker = get_tracker()
     tracker.track_openai_response(
@@ -183,7 +199,7 @@ def compress_research(state: ResearcherState) -> dict:
 
 def should_continue(
     state: ResearcherState,
-) -> Literal["tool_node", "compress_research"]:
+) -> Literal["tool_node", "compress_research", "llm_call"]:
     """Determine whether to continue research or provide final answer.
 
     Determines whether the agent should continue the research loop or provide
@@ -192,13 +208,21 @@ def should_continue(
     Returns:
         "tool_node": Continue to tool execution
         "compress_research": Stop and compress research
+        "llm_call": Force back to LLM call (when no searches performed)
     """
     messages = state["researcher_messages"]
     last_message = messages[-1]
+    tavily_search_count = state.get("tavily_search_count", 0)
 
     # If the LLM makes a tool call, continue to tool execution
     if last_message.tool_calls:
         return "tool_node"
+    
+    # ENFORCEMENT: Require at least one Tavily search before allowing compression
+    if tavily_search_count == 0:
+        # Force the agent back to llm_call to get a reminder to search
+        return "llm_call"
+    
     # Otherwise, we have a final answer
     return "compress_research"
 
@@ -221,6 +245,7 @@ agent_builder.add_conditional_edges(
     {
         "tool_node": "tool_node",  # Continue research loop
         "compress_research": "compress_research",  # Provide final answer
+        "llm_call": "llm_call",  # Force back to LLM (enforcement for Tavily search)
     },
 )
 agent_builder.add_edge("tool_node", "llm_call")  # Loop back for more research
